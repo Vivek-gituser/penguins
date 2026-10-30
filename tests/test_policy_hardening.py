@@ -45,6 +45,7 @@ def test_invalid_recipient_clearance_is_blocked():
 
 def test_string_clearance_is_parsed_safely():
     policy = demo_policy()
+    policy.approval_required_operations.clear()
     policy.recipient_clearance["team@example.com"] = "CONFIDENTIAL"
 
     request = ActionRequest(

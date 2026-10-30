@@ -3,10 +3,13 @@ import pandas as pd
 
 from database.db import init_db, list_audit_events
 from database.artifact_store import ArtifactStore
+from database.supabase_repository import SupabaseRepository
 from security.policy_engine import PolicyEngine, ActionRequest, demo_policy
 from security.content_guard import wrap_untrusted_document, safe_document_context
 from security.labels import SecurityLabel
 from gateway import SecureGateway
+from agent.research_agent import ResearchAgent
+from security.reviewer_auth import sign_in_reviewer, restore_reviewer_session, is_active_reviewer
 
 from tools.document_reader import DocumentReader
 from tools.report_saver import ReportSaver
@@ -83,8 +86,21 @@ LABEL_COLORS = {
 }
 
 
+
+def get_approval_store():
+    backend = st.session_state.get("audit_backend", "SQLite")
+    if backend == "Supabase":
+        return SupabaseRepository()
+    from database.approval_store import ApprovalStore
+    return ApprovalStore()
+
+
 def make_gateway(recipient=""):
-    gateway = SecureGateway(PolicyEngine(demo_policy()))
+    gateway = SecureGateway(
+        PolicyEngine(demo_policy()),
+        audit_repository=get_audit_repository(),
+        approval_store=get_approval_store(),
+    )
 
     gateway.register_tool(
         "read", "documents", reader.read_sample
@@ -107,30 +123,117 @@ def make_gateway(recipient=""):
     return gateway
 
 
+def get_audit_repository():
+    backend = st.session_state.get("audit_backend", "SQLite")
+    if backend == "Supabase":
+        return SupabaseRepository()
+    return None
+
+
+def get_artifact_store():
+    backend = st.session_state.get("audit_backend", "SQLite")
+    if backend == "Supabase":
+        return SupabaseRepository()
+    return ArtifactStore()
+
+
 def get_events():
+    repository = get_audit_repository()
+    if repository is not None:
+        return repository.list_audit_events(limit=100)
+    return list_audit_events()
+
+
+
+
+# ---------------- REVIEWER SESSION ----------------
+reviewer = None
+
+if st.session_state.get("reviewer_access_token"):
     try:
-        return list_audit_events()
+        reviewer = restore_reviewer_session(
+            st.session_state["reviewer_access_token"],
+            st.session_state["reviewer_refresh_token"],
+        )
+        st.session_state["reviewer_access_token"] = reviewer["access_token"]
+        st.session_state["reviewer_refresh_token"] = reviewer["refresh_token"]
+        st.session_state["reviewer_user_id"] = reviewer["user_id"]
     except Exception:
-        return []
+        for key in (
+            "reviewer_access_token",
+            "reviewer_refresh_token",
+            "reviewer_user_id",
+            "reviewer_email",
+        ):
+            st.session_state.pop(key, None)
+        reviewer = None
 
 
 # ---------------- SIDEBAR ----------------
 with st.sidebar:
     st.markdown("## 🛡️ AGENTGATE")
     st.caption("AI ACTION SECURITY PLATFORM")
+
+    st.selectbox(
+        "AUDIT STORAGE BACKEND",
+        ["SQLite", "Supabase"],
+        key="audit_backend",
+        help="Choose where gateway audit events are stored and read.",
+    )
+
+    st.divider()
+    st.markdown("### HUMAN REVIEWER")
+
+    if reviewer:
+        st.success(f"Verified: {reviewer['email']}")
+        if st.button("Sign out reviewer", use_container_width=True):
+            for key in (
+                "reviewer_access_token",
+                "reviewer_refresh_token",
+                "reviewer_user_id",
+                "reviewer_email",
+            ):
+                st.session_state.pop(key, None)
+            st.rerun()
+    else:
+        with st.form("reviewer_login_form"):
+            reviewer_email = st.text_input("Reviewer email")
+            reviewer_password = st.text_input(
+                "Password",
+                type="password",
+            )
+            login_submitted = st.form_submit_button(
+                "Secure reviewer login",
+                use_container_width=True,
+            )
+
+        if login_submitted:
+            try:
+                login = sign_in_reviewer(reviewer_email, reviewer_password)
+                st.session_state["reviewer_access_token"] = login["access_token"]
+                st.session_state["reviewer_refresh_token"] = login["refresh_token"]
+                st.session_state["reviewer_user_id"] = login["user_id"]
+                st.session_state["reviewer_email"] = login["email"]
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Reviewer login failed: {exc}")
+
     st.divider()
 
-    page = st.radio(
-        "NAVIGATION",
-        [
-            "Overview",
-            "Action Simulator",
-            "Prompt Injection Lab",
-            "Information Flow",
-            "Artifact Vault",
-            "Audit Center",
-        ],
-    )
+    navigation = [
+        "Overview",
+        "Agent Chat",
+        "Action Simulator",
+        "Prompt Injection Lab",
+        "Information Flow",
+        "Artifact Vault",
+        "Audit Center",
+    ]
+
+    if reviewer:
+        navigation.append("Approval Center")
+
+    page = st.radio("NAVIGATION", navigation)
 
     st.divider()
     st.markdown("### SYSTEM STATUS")
@@ -297,6 +400,113 @@ elif page == "Action Simulator":
     )
 
 
+
+# ---------------- APPROVAL CENTER ----------------
+elif page == "Approval Center":
+    st.subheader("Human Approval Center")
+    st.caption("Only authenticated, allowlisted reviewers can review actions.")
+
+    if not reviewer or not is_active_reviewer(reviewer["user_id"]):
+        st.error("Reviewer authorization is no longer active. Sign in again.")
+        st.stop()
+
+    if st.session_state.get("audit_backend") != "Supabase":
+        st.warning("Select Supabase as the storage backend to review cloud approvals.")
+    else:
+        repository = SupabaseRepository()
+
+        try:
+            pending_requests = repository.list_pending(limit=100)
+
+            if not pending_requests:
+                st.success("No pending approval requests.")
+            else:
+                st.write(f"Pending requests: {len(pending_requests)}")
+
+                for item in pending_requests:
+                    with st.container(border=True):
+                        st.markdown(f"**Request:** `{item['id']}`")
+                        st.write("Agent:", item["agent_id"])
+                        st.write("Operation:", item["operation"])
+                        st.write("Resource:", item["resource"])
+                        st.write("Recipient:", item["recipient"])
+                        st.write("Sensitivity:", item["data_label"])
+                        st.write("Status:", item["status"])
+
+                        col_approve, col_reject = st.columns(2)
+
+                        with col_approve:
+                            if st.button(
+                                "Approve and execute",
+                                key=f"approve_{item['id']}",
+                                type="primary",
+                                use_container_width=True,
+                            ):
+                                try:
+                                    if not is_active_reviewer(reviewer["user_id"]):
+                                        raise PermissionError("Reviewer access has been revoked.")
+
+                                    repository.review(
+                                        item["id"],
+                                        "APPROVED",
+                                        reviewer["user_id"],
+                                    )
+
+                                    request = ActionRequest(
+                                        agent_id=item["agent_id"],
+                                        operation=item["operation"],
+                                        resource=item["resource"],
+                                        recipient=item["recipient"],
+                                        data_label=SecurityLabel.parse(item["data_label"]),
+                                    )
+
+                                    gateway = make_gateway(
+                                        item["recipient"]
+                                        if item["operation"] == "deliver"
+                                        else ""
+                                    )
+
+                                    outcome = gateway.approve_and_execute(
+                                        item["id"],
+                                        request,
+                                    )
+
+                                    if outcome.decision.value == "ALLOW":
+                                        st.success("Approved and executed successfully.")
+                                        if outcome.result is not None:
+                                            st.json(outcome.result)
+                                    else:
+                                        st.error(f"Execution blocked: {outcome.reason}")
+
+                                    st.rerun()
+
+                                except Exception as exc:
+                                    st.error(f"Approval failed: {exc}")
+
+                        with col_reject:
+                            if st.button(
+                                "Reject",
+                                key=f"reject_{item['id']}",
+                                use_container_width=True,
+                            ):
+                                try:
+                                    if not is_active_reviewer(reviewer["user_id"]):
+                                        raise PermissionError("Reviewer access has been revoked.")
+
+                                    repository.review(
+                                        item["id"],
+                                        "REJECTED",
+                                        reviewer["user_id"],
+                                    )
+                                    st.success("Request rejected.")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"Rejection failed: {exc}")
+
+        except Exception as exc:
+            st.error(f"Could not load approval requests: {exc}")
+
+
 # ---------------- PROMPT INJECTION LAB ----------------
 elif page == "Prompt Injection Lab":
     st.subheader("🧪 Prompt Injection Security Lab")
@@ -433,7 +643,7 @@ elif page == "Artifact Vault":
     st.caption("Save, reload and inspect derived artifacts with trusted provenance.")
 
     try:
-        artifact_store = ArtifactStore()
+        artifact_store = get_artifact_store()
 
         with st.form("save_artifact"):
             content = st.text_area(
@@ -540,9 +750,15 @@ elif page == "Audit Center":
     st.subheader("📋 Security Audit Center")
     st.caption("Review recorded security decisions.")
 
-    events = get_events()
+    try:
+        events = get_events()
+    except Exception as exc:
+        st.error(f"Audit backend unavailable: {exc}")
+        events = None
 
-    if events:
+    if events is None:
+        pass
+    elif events:
         allowed = [
             e for e in events if e.get("decision") == "ALLOW"
         ]
@@ -575,6 +791,85 @@ elif page == "Audit Center":
 
     else:
         st.info("No audit events available yet.")
+
+
+
+# ---------------- AGENT CHAT ----------------
+elif page == "Agent Chat":
+    st.subheader("?? AGENTGATE Research Agent")
+    st.caption(
+        "Give your research task to the agent. "
+        "Every protected tool action passes through SecureGateway."
+    )
+
+    st.info(
+        "Current mode: Deterministic research agent. "
+        "LLM integration will be added separately."
+    )
+
+    task = st.text_area(
+        "What should the agent do?",
+        placeholder=(
+            "Research the document and create a summary report"
+        ),
+        height=110,
+        key="research_agent_task",
+    )
+
+    if st.button("?? Run Research Agent", type="primary"):
+        if not task.strip():
+            st.warning("Please enter a research task.")
+        else:
+            try:
+                with st.spinner("Agent is researching securely..."):
+                    result = ResearchAgent(
+                        artifact_store=get_artifact_store(),
+                        audit_repository=get_audit_repository(),
+                    ).run(task)
+
+                st.session_state["last_agent_result"] = result
+
+            except Exception as exc:
+                st.error(
+                    f"Agent execution failed: {type(exc).__name__}: {exc}"
+                )
+
+    result = st.session_state.get("last_agent_result")
+
+    if result is not None:
+        st.divider()
+        st.markdown("### Agent Result")
+
+        if result.status == "SUCCESS":
+            st.success(result.message)
+        elif result.status == "BLOCKED":
+            st.error(result.message)
+        else:
+            st.warning(result.message)
+
+        if result.summary:
+            st.markdown("#### Generated Summary")
+            st.write(result.summary)
+
+        if result.artifact:
+            col1, col2 = st.columns(2)
+            col1.metric("Sensitivity", result.artifact.get("label", "Unknown"))
+            col2.metric(
+                "Artifact ID",
+                result.artifact.get("artifact_id", "Unavailable")[:12] + "..."
+            )
+
+        if result.actions:
+            st.markdown("#### Gateway Decisions")
+            st.dataframe(
+                result.actions,
+                width="stretch",
+                hide_index=True,
+            )
+
+        if result.artifact:
+            with st.expander("View saved artifact details"):
+                st.json(result.artifact)
 
 
 # ---------------- FOOTER ----------------

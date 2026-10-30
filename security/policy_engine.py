@@ -34,6 +34,7 @@ class SecurityPolicy:
     resource_permissions: dict = field(default_factory=dict)
     authorized_recipients: set = field(default_factory=set)
     recipient_clearance: dict = field(default_factory=dict)
+    approval_required_operations: set = field(default_factory=set)
 
 
 class PolicyEngine:
@@ -93,6 +94,12 @@ class PolicyEngine:
         except (AttributeError, TypeError):
             return PolicyResult(Decision.BLOCK, "Malformed trusted policy configuration")
 
+        if req.operation in self.policy.approval_required_operations:
+            return PolicyResult(
+                Decision.REQUIRE_APPROVAL,
+                "This operation requires human approval",
+            )
+
         return PolicyResult(Decision.ALLOW, "All policy checks passed")
 
 
@@ -109,6 +116,7 @@ def demo_policy():
         authorized_recipients={
             "team@example.com", "public@example.com"
         },
+        approval_required_operations={"deliver"},
         recipient_clearance={
             "team@example.com": SecurityLabel.CONFIDENTIAL,
             "public@example.com": SecurityLabel.PUBLIC

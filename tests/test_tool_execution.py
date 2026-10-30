@@ -117,3 +117,56 @@ def test_invalid_tool_registration_is_rejected():
 
     with pytest.raises(TypeError):
         gateway.register_tool("read", "documents", "not-callable")
+
+
+def test_audit_failure_prevents_tool_execution(monkeypatch):
+    import pytest
+    import gateway as gateway_module
+
+    def failing_audit(*args):
+        raise RuntimeError("simulated audit outage")
+
+    monkeypatch.setattr(
+        gateway_module,
+        "write_audit_event",
+        failing_audit,
+    )
+
+    called = []
+    gateway = SecureGateway(PolicyEngine(demo_policy()))
+    gateway.register_tool(
+        "read", "documents",
+        lambda: called.append("executed"),
+    )
+
+    request = ActionRequest("research-agent", "read", "documents")
+
+    with pytest.raises(RuntimeError, match="tool was not executed"):
+        gateway.execute(request)
+
+    assert called == []
+
+
+def test_supabase_audit_repository_is_injected():
+    audit_statuses = []
+
+    class FakeAuditRepository:
+        def write_audit_event(self, request, decision, reason, status):
+            audit_statuses.append(status)
+
+    called = []
+    gateway = SecureGateway(
+        PolicyEngine(demo_policy()),
+        audit_repository=FakeAuditRepository(),
+    )
+    gateway.register_tool(
+        "read", "documents",
+        lambda: called.append("executed"),
+    )
+
+    request = ActionRequest("research-agent", "read", "documents")
+    result = gateway.execute(request)
+
+    assert result.decision == Decision.ALLOW
+    assert called == ["executed"]
+    assert audit_statuses == ["PENDING", "SUCCESS"]
