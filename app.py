@@ -429,8 +429,8 @@ elif page == "Information Flow":
 
 # ---------------- ARTIFACT VAULT ----------------
 elif page == "Artifact Vault":
-    st.subheader("🗄️ Artifact Vault")
-    st.caption("Save, reload and inspect derived artifacts with provenance.")
+    st.subheader("??? Artifact Vault")
+    st.caption("Save, reload and inspect derived artifacts with trusted provenance.")
 
     try:
         artifact_store = ArtifactStore()
@@ -441,14 +441,16 @@ elif page == "Artifact Vault":
                 placeholder="Enter derived report content..."
             )
 
-            source_ids = st.text_input(
-                "Source IDs (comma separated)",
-                "sample_internal"
-            )
+            registered_sources = [
+                "sample_internal",
+                "sample_prompt_injection",
+            ]
 
-            source_labels = st.text_input(
-                "Source sensitivity labels (comma separated)",
-                "INTERNAL"
+            source_ids = st.multiselect(
+                "Select registered source documents",
+                options=registered_sources,
+                default=["sample_internal"],
+                help="Sensitivity labels are retrieved from the trusted source registry."
             )
 
             transformation = st.selectbox(
@@ -461,42 +463,40 @@ elif page == "Artifact Vault":
                 ]
             )
 
-            save = st.form_submit_button(
-                "💾 Save Secure Artifact",
-                type="primary"
-            )
+            save = st.form_submit_button("Save Secure Artifact")
+
+        if source_ids:
+            trusted_labels = {
+                source_id: artifact_store.get_trusted_source_label(source_id).name
+                for source_id in source_ids
+            }
+            st.write("**Verified source classifications:**")
+            st.json(trusted_labels)
 
         if save:
             try:
-                ids = [
-                    x.strip() for x in source_ids.split(",") if x.strip()
-                ]
-                labels = [
-                    x.strip().upper()
-                    for x in source_labels.split(",")
-                    if x.strip()
-                ]
-
                 if not content.strip():
                     st.error("Report content cannot be empty.")
-                elif len(ids) != len(labels):
-                    st.error(
-                        "Every source ID must have exactly one sensitivity label."
-                    )
+                elif not source_ids:
+                    st.error("Select at least one registered source.")
                 else:
+                    labels = [
+                        artifact_store.get_trusted_source_label(source_id).name
+                        for source_id in source_ids
+                    ]
+
                     saved = artifact_store.save(
                         content,
-                        ids,
+                        source_ids,
                         labels,
                         transformation,
                     )
 
-                    st.success("Artifact saved successfully.")
+                    st.success("Artifact saved and provenance verified.")
                     st.code(saved["artifact_id"])
-
                     st.info(
-                        "The ArtifactStore calculates the inherited "
-                        "sensitivity from the supplied source labels."
+                        f"Inherited sensitivity: {saved['label']}. "
+                        "The label is derived from trusted source metadata."
                     )
 
             except Exception as exc:
@@ -507,18 +507,13 @@ elif page == "Artifact Vault":
 
         artifact_id = st.text_input("Artifact ID")
 
-        if st.button("🔄 Load and Verify Artifact"):
+        if st.button("?? Load and Verify Artifact"):
             try:
                 loaded = artifact_store.load(artifact_id.strip())
 
-                st.success("Artifact loaded and provenance validated.")
-
                 col1, col2 = st.columns(2)
                 col1.metric("Sensitivity", loaded["label"])
-                col2.metric(
-                    "Source Count",
-                    len(loaded["source_ids"])
-                )
+                col2.metric("Source Count", len(loaded["source_ids"]))
 
                 st.write("**Source IDs:**", loaded["source_ids"])
                 st.write("**Source Labels:**", loaded["source_labels"])
