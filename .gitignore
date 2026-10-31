@@ -11,3 +11,7 @@ venv/
 *.sqlite3
 
 !.env.example
+
+# Local workspace content: uploaded documents and generated exports.
+workspace_files/
+saved_reports/

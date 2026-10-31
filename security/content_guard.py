@@ -21,3 +21,37 @@ def safe_document_context(document: UntrustedDocument) -> dict[str, Any]:
         "may_authorize_actions": False,
         "may_modify_policy": False,
     }
+
+INJECTION_SIGNALS = (
+    "ignore all previous instructions",
+    "ignore previous instructions",
+    "disregard the above",
+    "system override",
+    "urgent system",
+    "new instructions",
+    "reveal all private",
+    "exfiltrate",
+    "modify the security policy",
+    "authorize this action",
+    "you must send",
+)
+
+EMAIL_PATTERN = __import__("re").compile(
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+)
+
+
+def detect_injection_signals(content):
+    """Advisory only: flags instruction-shaped text so it can be shown to a
+    human. A signal never authorizes or blocks an action - the policy engine
+    remains the only decision maker."""
+    if not isinstance(content, str) or not content.strip():
+        return []
+
+    lowered = content.lower()
+    found = [signal for signal in INJECTION_SIGNALS if signal in lowered]
+
+    if "send" in lowered and EMAIL_PATTERN.search(content):
+        found.append("delivery instruction addressed to an email recipient")
+
+    return found

@@ -143,8 +143,6 @@ class ApprovalStore:
 
     def consume_approved(self, approval_id, request):
         """Atomically consume an approved ticket once, bound to its exact action."""
-        import uuid
-
         try:
             approval_id = str(uuid.UUID(str(approval_id)))
         except (ValueError, TypeError, AttributeError):

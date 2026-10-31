@@ -1,0 +1,157 @@
+"""Structured models for everything a language model is allowed to return.
+
+Every model response is parsed through one of these before the application
+looks at it. Anything that does not validate is discarded, and a validated
+proposal still carries no authority - SecureGateway decides independently.
+"""
+
+import re
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from tools.document_spec import (
+    DocumentSection,
+    DocumentSpec,
+    clean_text,
+    MAX_HEADING_CHARS,
+    MAX_TITLE_CHARS,
+)
+
+MAX_RATIONALE_CHARS = 500
+MAX_RECIPIENT_CHARS = 254
+MAX_SOURCE_ID_CHARS = 64
+
+EMAIL_PATTERN = re.compile(
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+)
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+class ActionProposal(BaseModel):
+    """One step a model thinks the user asked for. Not an authorization."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    operation: str
+    resource: str
+    recipient: str = ""
+    data_label: str | None = None
+    source_id: str = ""
+    title: str = ""
+    rationale: str = ""
+
+    @field_validator("operation", "resource")
+    @classmethod
+    def _name(cls, value):
+        return _CONTROL.sub("", str(value or "")).strip().lower()[:64]
+
+    @field_validator("recipient")
+    @classmethod
+    def _recipient(cls, value):
+        cleaned = _CONTROL.sub("", str(value or "")).strip()
+        if len(cleaned) > MAX_RECIPIENT_CHARS:
+            return ""
+        return cleaned
+
+    @field_validator("source_id")
+    @classmethod
+    def _source(cls, value):
+        return _CONTROL.sub("", str(value or "")).strip()[:MAX_SOURCE_ID_CHARS]
+
+    @field_validator("title")
+    @classmethod
+    def _title(cls, value):
+        return " ".join(_CONTROL.sub(" ", str(value or "")).split())[:MAX_TITLE_CHARS]
+
+    @field_validator("rationale")
+    @classmethod
+    def _rationale(cls, value):
+        return " ".join(_CONTROL.sub(" ", str(value or "")).split())[:MAX_RATIONALE_CHARS]
+
+
+class ProposalSet(BaseModel):
+    """The whole interpreter reply, including the human-facing commentary."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    commentary: str = ""
+    proposals: list[ActionProposal] = Field(default_factory=list)
+
+    @field_validator("commentary")
+    @classmethod
+    def _commentary(cls, value):
+        return " ".join(_CONTROL.sub(" ", str(value or "")).split())[:2000]
+
+
+class EmailDraft(BaseModel):
+    """A draft only. Delivery is a separate, gateway-decided action."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    subject: str
+    body: str
+
+    @field_validator("subject")
+    @classmethod
+    def _subject(cls, value):
+        return clean_text(value, 120)
+
+    @field_validator("body")
+    @classmethod
+    def _body(cls, value):
+        if not isinstance(value, str):
+            raise ValueError("Email body must be a string")
+        text = value.replace("\r\n", "\n")
+        text = "".join(char for char in text if char == "\n" or char >= " ")
+        text = text.strip()
+        if not text:
+            raise ValueError("Email body cannot be empty")
+        if len(text) > 6000:
+            raise ValueError("Email body is too long")
+        return text
+
+
+def parse_proposals(payload):
+    """Return validated proposals, or nothing at all if the reply is malformed."""
+    if not isinstance(payload, dict):
+        return ProposalSet()
+
+    try:
+        return ProposalSet.model_validate(payload)
+    except Exception:
+        return ProposalSet()
+
+
+def parse_document_spec(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Model returned no document structure")
+    return DocumentSpec.model_validate(payload)
+
+
+def parse_email_draft(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Model returned no email draft")
+    return EmailDraft.model_validate(payload)
+
+
+def valid_recipient(recipient):
+    return bool(
+        isinstance(recipient, str)
+        and EMAIL_PATTERN.fullmatch(recipient.strip())
+        and len(recipient.strip()) <= MAX_RECIPIENT_CHARS
+    )
+
+
+__all__ = [
+    "ActionProposal",
+    "EmailDraft",
+    "DocumentSection",
+    "DocumentSpec",
+    "ProposalSet",
+    "MAX_HEADING_CHARS",
+    "parse_document_spec",
+    "parse_email_draft",
+    "parse_proposals",
+    "valid_recipient",
+]

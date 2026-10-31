@@ -1,4 +1,6 @@
-﻿import os
+﻿
+import os
+import uuid
 
 from dotenv import load_dotenv
 from supabase import create_client
@@ -13,13 +15,20 @@ def _auth_client():
     key = os.getenv("SUPABASE_ANON_KEY")
 
     if not url or not key:
-        raise RuntimeError("Supabase URL or publishable key is missing.")
+        raise RuntimeError(
+            "Supabase URL or publishable key is missing."
+        )
 
     return create_client(url, key)
 
 
 def is_active_reviewer(user_id):
     if not isinstance(user_id, str) or not user_id.strip():
+        return False
+
+    try:
+        user_id = str(uuid.UUID(user_id.strip()))
+    except (ValueError, TypeError, AttributeError):
         return False
 
     response = (
@@ -30,15 +39,22 @@ def is_active_reviewer(user_id):
         .execute()
     )
 
-    return bool(response.data and response.data.get("active") is True)
+    return bool(
+        response.data
+        and response.data.get("active") is True
+    )
 
 
 def _session_data(client, user, session):
     if not user or not session:
-        raise RuntimeError("Supabase did not return a valid session.")
+        raise RuntimeError(
+            "Supabase did not return a valid session."
+        )
 
     if not is_active_reviewer(user.id):
-        raise PermissionError("This account is not an active AGENTGATE reviewer.")
+        raise PermissionError(
+            "This account is not an active AGENTGATE reviewer."
+        )
 
     return {
         "user_id": user.id,
@@ -56,12 +72,17 @@ def sign_in_reviewer(email, password):
         raise ValueError("Enter your password.")
 
     client = _auth_client()
+
     response = client.auth.sign_in_with_password({
         "email": email.strip(),
         "password": password,
     })
 
-    return _session_data(client, response.user, response.session)
+    return _session_data(
+        client,
+        response.user,
+        response.session,
+    )
 
 
 def restore_reviewer_session(access_token, refresh_token):
@@ -74,4 +95,28 @@ def restore_reviewer_session(access_token, refresh_token):
     user_response = client.auth.get_user()
     session = client.auth.get_session()
 
-    return _session_data(client, user_response.user, session)
+    return _session_data(
+        client,
+        user_response.user,
+        session,
+    )
+
+
+def verify_reviewer_session(access_token, refresh_token):
+    """
+    Restore the Supabase session and verify the reviewer is active.
+
+    Returns verified reviewer information. Never trust a user ID
+    stored in Streamlit session state without this check.
+    """
+    reviewer = restore_reviewer_session(
+        access_token,
+        refresh_token,
+    )
+
+    if not is_active_reviewer(reviewer["user_id"]):
+        raise PermissionError(
+            "Reviewer access has been revoked."
+        )
+
+    return reviewer

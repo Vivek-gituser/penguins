@@ -1,23 +1,54 @@
-﻿import streamlit as st
+import time
+
+import streamlit as st
 import pandas as pd
 
 from database.db import init_db, list_audit_events
 from database.artifact_store import ArtifactStore
 from database.supabase_repository import SupabaseRepository
-from security.policy_engine import PolicyEngine, ActionRequest, demo_policy
-from security.content_guard import wrap_untrusted_document, safe_document_context
+from security.policy_engine import (
+    PolicyEngine,
+    ActionRequest,
+    Decision,
+    demo_policy,
+)
+from security.content_guard import (
+    detect_injection_signals,
+    wrap_untrusted_document,
+    safe_document_context,
+)
 from security.labels import SecurityLabel
+from security.local_reviewer import (
+    is_local_reviewer_configured,
+    local_reviewer_id,
+    unlock_local_reviewer,
+)
 from gateway import SecureGateway
 from agent.research_agent import ResearchAgent
+from agent.workspace_agent import WorkspaceAgent
 from security.reviewer_auth import sign_in_reviewer, restore_reviewer_session, is_active_reviewer
+from ai import interpreter as ai_interpreter
 
 from tools.document_reader import DocumentReader
 from tools.report_saver import ReportSaver
 from tools.mock_inbox import MockInbox
+from tools.file_workspace import (
+    SecureFileWorkspace,
+    UPLOAD_SUFFIXES,
+    MAX_FILE_BYTES,
+)
+
+from ui import theme
+from ui import dashboard as dashboard_page
+from ui import files_page
+from ui import create_page
+from ui import email_page
+from ui.context import WorkspaceContext
+from ui.downloads import authorized_bytes, mime_for
 
 
 st.set_page_config(
-    page_title="AGENTGATE | AI Security Gateway",
+    page_title="AGENTGATE | Your AI workspace",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -26,49 +57,7 @@ st.set_page_config(
 init_db()
 
 # ---------------- THEME ----------------
-st.markdown("""
-<style>
-.stApp {
-    background: #0b1020;
-}
-[data-testid="stSidebar"] {
-    background: #111a2e;
-    border-right: 1px solid #26334d;
-}
-.hero {
-    padding: 25px;
-    border: 1px solid #263957;
-    border-radius: 16px;
-    background: linear-gradient(120deg,#14243c,#101827);
-    margin-bottom: 20px;
-}
-.hero h1 {
-    font-size: 36px;
-    margin-bottom: 4px;
-}
-.hero p {
-    color: #a9bad2;
-    margin-bottom: 0;
-}
-.section-card {
-    border: 1px solid #293750;
-    background: #121c30;
-    border-radius: 12px;
-    padding: 16px;
-    margin-bottom: 12px;
-}
-.small-muted {
-    color: #9aabc2;
-    font-size: 13px;
-}
-div[data-testid="stMetric"] {
-    background: #121c30;
-    border: 1px solid #293750;
-    padding: 15px;
-    border-radius: 12px;
-}
-</style>
-""", unsafe_allow_html=True)
+theme.apply_theme()
 
 
 # ---------------- SERVICES ----------------
@@ -85,6 +74,45 @@ LABEL_COLORS = {
     "RESTRICTED": "🔴",
 }
 
+PRIMARY_PAGES = [
+    "Home",
+    "AI Workspace",
+    "Files",
+    "Create Files",
+    "Email",
+    "Approvals",
+    "Access Control",
+    "Activity",
+]
+
+NO_ADVANCED_TOOL = "Choose a security tool"
+
+ADVANCED_PAGES_BASE = [
+    "Action Simulator",
+    "Prompt Injection Lab",
+    "Information Flow",
+    "Artifact Vault",
+    "Agent Chat",
+]
+
+
+def go(page):
+    """Ask the sidebar to open another page, then redraw.
+
+    Widgets are only written before they are instantiated, so a pending
+    request is resolved at the top of the next run.
+    """
+    st.session_state["requested_page"] = page
+    st.rerun()
+
+
+def get_file_workspace():
+    if "file_workspace" not in st.session_state:
+        st.session_state["file_workspace"] = SecureFileWorkspace(
+            artifact_store=get_artifact_store()
+        )
+    return st.session_state["file_workspace"]
+
 
 
 def get_approval_store():
@@ -95,9 +123,45 @@ def get_approval_store():
     return ApprovalStore()
 
 
+def get_permission_store():
+    from database.permission_store import PermissionStore
+
+    if "permission_store" not in st.session_state:
+        st.session_state["permission_store"] = PermissionStore()
+    return st.session_state["permission_store"]
+
+
+def apply_permission_overrides(policy):
+    # If the override store cannot be read we cannot know which permissions
+    # were revoked, so the request fails closed instead of falling back to
+    # the wider base profile.
+    from database.permission_store import apply_overrides
+
+    return apply_overrides(policy, get_permission_store().list_overrides())
+
+
+def get_policy():
+    return apply_permission_overrides(demo_policy())
+
+
+def policy_vocabulary(policy):
+    return {
+        "operations": {
+            operation
+            for operations in policy.agent_permissions.values()
+            for operation in operations
+        },
+        "operation_resource": {
+            operation: resource
+            for resource, operations in policy.resource_permissions.items()
+            for operation in operations
+        },
+    }
+
+
 def make_gateway(recipient=""):
     gateway = SecureGateway(
-        PolicyEngine(demo_policy()),
+        PolicyEngine(get_policy()),
         audit_repository=get_audit_repository(),
         approval_store=get_approval_store(),
     )
@@ -115,12 +179,102 @@ def make_gateway(recipient=""):
             "deliver",
             "inbox",
             lambda: inbox.deliver(
-                "AGENTGATE demonstration report",
+                approved_message(recipient),
                 recipient
             )
         )
 
     return gateway
+
+
+def is_reviewer_authorized(reviewer_id):
+    """Re-check the reviewer identity at the moment of the decision.
+
+    Cloud reviewers are re-verified against the allowlist. The local demo
+    reviewer only counts while this session holds the unlock.
+    """
+    if reviewer_id == local_reviewer_id():
+        return st.session_state.get("local_reviewer_id") == reviewer_id
+
+    return is_active_reviewer(reviewer_id)
+
+
+def audit_permission_change(reviewer_id, description, status="SUCCESS"):
+    """Permission changes are reviewer-only, but still fully auditable."""
+    from database.db import write_audit_event as local_write
+
+    request = ActionRequest(
+        agent_id=f"reviewer-{str(reviewer_id)[:8]}",
+        operation="update_permissions",
+        resource="policy",
+        recipient="",
+        data_label=SecurityLabel.RESTRICTED,
+    )
+
+    repository = get_audit_repository()
+    writer = (
+        repository.write_audit_event if repository is not None else local_write
+    )
+    writer(request, "ALLOW", description, status)
+
+
+def reviewer_gate():
+    """Return an authorized reviewer id, rendering the unlock path as needed."""
+    if reviewer and is_active_reviewer(reviewer["user_id"]):
+        st.success(f"Acting as verified reviewer: {reviewer['email']}")
+        return reviewer["user_id"]
+
+    if st.session_state.get("audit_backend", "SQLite") == "SQLite":
+        if st.session_state.get("local_reviewer_id"):
+            st.success("Acting as the local demo reviewer.")
+
+            if st.button("Lock reviewing", key="local_reviewer_lock"):
+                st.session_state.pop("local_reviewer_id", None)
+                st.rerun()
+
+            return st.session_state["local_reviewer_id"]
+
+        if not is_local_reviewer_configured():
+            st.error(
+                "Reviewing is not authorized. Sign in as a Supabase "
+                "reviewer, or set AGENTGATE_REVIEWER_PASSWORD for the local "
+                "demo database."
+            )
+            return None
+
+        with st.form("local_reviewer_unlock"):
+            local_password = st.text_input(
+                "Local reviewer credential",
+                type="password",
+            )
+            unlocked = st.form_submit_button("Unlock reviewing")
+
+        if unlocked:
+            try:
+                st.session_state["local_reviewer_id"] = unlock_local_reviewer(
+                    local_password
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+        return st.session_state.get("local_reviewer_id")
+
+    st.error("Sign in as a verified reviewer to review cloud approvals.")
+    return None
+
+
+def approved_message(recipient):
+    """Content handed to the delivery tool when a parked action runs.
+
+    The ticket binds agent, operation, resource, recipient and label; the
+    report body itself is supplied by this trusted application layer.
+    """
+    payload = st.session_state.get("workspace_payloads", {}).get(recipient)
+    if payload:
+        return payload
+    return "AGENTGATE demonstration report"
+
 
 
 def get_audit_repository():
@@ -220,101 +374,441 @@ with st.sidebar:
 
     st.divider()
 
-    navigation = [
-        "Overview",
-        "Agent Chat",
-        "Action Simulator",
-        "Prompt Injection Lab",
-        "Information Flow",
-        "Artifact Vault",
-        "Audit Center",
-    ]
+    advanced_pages = list(ADVANCED_PAGES_BASE)
 
-    if reviewer:
-        navigation.append("Approval Center")
+    if reviewer and st.session_state.get("audit_backend") == "Supabase":
+        advanced_pages.append("Declassification Center")
 
-    page = st.radio("NAVIGATION", navigation)
+    def on_primary_change():
+        # Choosing a workspace page always wins over an open security tool,
+        # otherwise the two controls would fight over which page renders.
+        st.session_state["nav_advanced"] = NO_ADVANCED_TOOL
+
+    requested = st.session_state.pop("requested_page", None)
+    if requested in PRIMARY_PAGES:
+        st.session_state["nav_primary"] = requested
+    elif requested in ADVANCED_PAGES_BASE:
+        st.session_state["nav_advanced"] = requested
+        if "nav_primary" not in st.session_state:
+            st.session_state["nav_primary"] = PRIMARY_PAGES[0]
+    else:
+        for key, options in (("nav_primary", PRIMARY_PAGES),
+                             ("nav_advanced", [NO_ADVANCED_TOOL] + advanced_pages)):
+            if st.session_state.get(key) not in options:
+                st.session_state[key] = options[0]
+
+    primary_choice = st.radio(
+        "Workspace",
+        PRIMARY_PAGES,
+        key="nav_primary",
+        on_change=on_primary_change,
+    )
+
+    with st.expander("Advanced security tools"):
+        advanced_choice = st.selectbox(
+            "Security tool",
+            [NO_ADVANCED_TOOL] + advanced_pages,
+            key="nav_advanced",
+            help=(
+                "Developer and reviewer utilities that show the gateway "
+                "decisions behind the workspace pages."
+            ),
+        )
+
+    page = (
+        primary_choice
+        if advanced_choice == NO_ADVANCED_TOOL
+        else advanced_choice
+    )
 
     st.divider()
-    st.markdown("### SYSTEM STATUS")
-    st.success("Policy Engine Active")
-    st.success("Secure Gateway Active")
-    st.info("Mock tools only")
+    st.markdown("### STATUS")
+    st.caption("Policy engine: default-deny · Email delivery is simulated")
+
+    if ai_interpreter.is_configured():
+        if ai_interpreter.model_available():
+            st.success(f"Assistant model: {ai_interpreter.model_name()}")
+        else:
+            waiting = int(ai_interpreter.cooldown_remaining())
+
+            if waiting > 0:
+                st.warning(
+                    f"Assistant model is slow right now. The built-in rules "
+                    f"are answering instead - nothing is blocked. Retrying in "
+                    f"{waiting}s."
+                )
+            else:
+                st.warning(
+                    "Assistant model is not being used: "
+                    f"{ai_interpreter.unavailable_reason()}. The built-in "
+                    "rules answer instead."
+                )
+    else:
+        st.info(
+            "No model key found, so a built-in rule reader handles requests. "
+            "Nothing here depends on a live API."
+        )
+
     st.caption("Hackathon prototype")
 
 
-# ---------------- HEADER ----------------
-st.markdown("""
-<div class="hero">
-    <h1>🛡️ AGENTGATE</h1>
-    <p>Security Gateway for AI Actions and Information-Flow Control</p>
-    <p class="small-muted">
-    Deterministic policy enforcement between AI agents and external tools.
-    </p>
-</div>
-""", unsafe_allow_html=True)
+# ---------------- SHARED CONTEXT ----------------
+def build_context():
+    """Package the trusted services the page modules are allowed to reach.
 
-
-# ---------------- OVERVIEW ----------------
-if page == "Overview":
-    st.subheader("Security Operations Overview")
-
-    events = get_events()
-
-    total = len(events)
-    allowed = sum(e.get("decision") == "ALLOW" for e in events)
-    blocked = sum(e.get("decision") == "BLOCK" for e in events)
-    approval = sum(
-        e.get("decision") == "REQUIRE_APPROVAL" for e in events
+    Pages receive callables, never a live gateway, so every protected action
+    is built through make_gateway() and re-checked against current policy.
+    """
+    return WorkspaceContext(
+        get_policy=get_policy,
+        make_gateway=make_gateway,
+        get_artifact_store=get_artifact_store,
+        get_approval_store=get_approval_store,
+        get_events=get_events,
+        reviewer_gate=reviewer_gate,
+        audit_permission_change=audit_permission_change,
+        is_reviewer_authorized=is_reviewer_authorized,
+        workspace=get_file_workspace(),
+        inbox=inbox,
+        reader=reader,
+        labels=tuple(LABELS),
+        upload_suffixes=tuple(UPLOAD_SUFFIXES),
+        extra={
+            "max_file_bytes": MAX_FILE_BYTES,
+            "label_colors": LABEL_COLORS,
+            "policy_vocabulary": policy_vocabulary,
+            "approved_message": approved_message,
+            "saver": saver,
+        },
     )
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Actions", total)
-    c2.metric("Allowed", allowed)
-    c3.metric("Blocked", blocked)
-    c4.metric("Approval Required", approval)
 
-    st.divider()
+CTX = build_context()
 
-    left, right = st.columns(2)
+def _workspace_uploads(workspace):
+    try:
+        return [
+            record
+            for record in workspace.list_files(category="upload")
+            if record.get("category") == "upload"
+        ]
+    except Exception:
+        return []
 
-    with left:
-        st.markdown("### 🔐 Security Architecture")
-        st.markdown("""
-        <div class="section-card">
-        <b>1. AI Agent</b><br>
-        <span class="small-muted">Proposes an action</span><br><br>
-        ↓<br><br>
-        <b>2. Secure Gateway</b><br>
-        <span class="small-muted">Validates and intercepts the request</span><br><br>
-        ↓<br><br>
-        <b>3. Trusted Policy Engine</b><br>
-        <span class="small-muted">Makes deterministic authorization decision</span><br><br>
-        ↓<br><br>
-        <b>4. Tool Execution</b><br>
-        <span class="small-muted">Only authorized registered tools execute</span>
-        </div>
-        """, unsafe_allow_html=True)
 
-    with right:
-        st.markdown("### 🛡️ Protection Capabilities")
-        st.markdown("""
-        <div class="section-card">
-        ✅ Unknown agent rejection<br><br>
-        ✅ Unauthorized operation blocking<br><br>
-        ✅ Resource-level permissions<br><br>
-        ✅ Recipient clearance validation<br><br>
-        ✅ Sensitivity label enforcement<br><br>
-        ✅ Artifact provenance persistence<br><br>
-        ✅ Security audit trail
-        </div>
-        """, unsafe_allow_html=True)
+def _download_generated(record):
+    """Release one generated file through the gateway, then offer the bytes."""
+    released, payload = authorized_bytes(CTX, record["file_id"])
 
-    st.markdown("### Recent Security Events")
-    if events:
-        st.dataframe(events[:10], use_container_width=True, hide_index=True)
+    if released is None:
+        st.warning(
+            "AGENTGATE did not release this file: "
+            f"{payload.get('reason', 'no reason given')}"
+        )
+        return
+
+    st.download_button(
+        "Download",
+        data=payload,
+        file_name=record["display_name"],
+        mime=mime_for(record.get("suffix", "")),
+        key=f"ws_dl_{record['file_id']}",
+        use_container_width=True,
+    )
+
+
+def _render_turn(turn, go):
+    interpretation = turn["interpretation"]
+
+    st.caption(
+        "Understanding: "
+        + (
+            f"{interpretation['interpreter']} ({interpretation['model']})"
+            if interpretation.get("model")
+            else "built-in rules, because no model key is configured"
+        )
+    )
+
+    if interpretation["commentary"]:
+        st.write(interpretation["commentary"])
+
+    if interpretation["degraded"] and interpretation.get("interpreter") != "gemini":
+        st.info(
+            "The assistant model was skipped ("
+            + (ai_interpreter.unavailable_reason() or "it did not answer in time")
+            + "). The built-in rules handled this request instead, and the "
+            "gateway decisions are exactly the same either way."
+        )
+
+    if interpretation["injection_signals"]:
+        st.error(
+            "Instruction-shaped text was found inside the document. It was "
+            "treated as data only and could not create or change any action: "
+            + "; ".join(interpretation["injection_signals"])
+        )
+
+    if interpretation.get("request_signals"):
+        st.caption(
+            "Your request contains instruction-shaped wording ("
+            + "; ".join(interpretation["request_signals"])
+            + "). It became a proposal only; the gateway still decides."
+        )
+
+    if turn["actions"]:
+        st.markdown("**What was proposed, and how each step was decided**")
+        st.dataframe(
+            turn["actions"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if turn["summary"]:
+        st.markdown("**Summary built from the authorized text**")
+        st.text_area(
+            "Summary",
+            value=turn["summary"],
+            height=110,
+            disabled=True,
+            key=f"ws_sum_{id(turn)}",
+        )
+
+    if turn["artifact"]:
+        st.markdown("**Saved report**")
+        st.json(
+            {
+                "artifact_id": turn["artifact"].get("artifact_id"),
+                "label": turn["artifact"].get("label"),
+                "source_ids": turn["artifact"].get("source_ids"),
+            }
+        )
+
+    for record in turn.get("generated", []):
+        st.markdown(
+            f"**Created for you:** {theme.escape(record['display_name'])} "
+            f"({theme.human_size(record['size_bytes'])}, "
+            f"classified {theme.escape(record['label'])})"
+            + (
+                f" &middot; {record['slides']} slides"
+                if record.get("slides")
+                else ""
+            ),
+            unsafe_allow_html=True,
+        )
+        _download_generated(record)
+
+    if turn["delivered"]:
+        st.success(
+            "Simulated delivery completed to: "
+            + ", ".join(turn["delivered"])
+        )
+
+    if turn["status"] == "APPROVAL_REQUIRED":
+        st.info(
+            "The delivery is waiting in Approvals. The tool did not run."
+        )
+
+        if st.button("Open Approvals", key=f"ws_go_ap_{id(turn)}"):
+            go("Approvals")
+    elif turn["status"] == "BLOCKED":
+        st.error("AGENTGATE blocked at least one proposed action.")
+    elif turn["status"] == "NO_ACTIONS":
+        st.write(
+            "Nothing protected was needed for that request, so nothing ran."
+        )
+
+
+
+
+# ---------------- HOME ----------------
+if page == "Home":
+    dashboard_page.render(CTX, go)
+
+
+# ---------------- AI WORKSPACE ----------------
+elif page == "AI Workspace":
+    theme.hero(
+        "Ask for an outcome, not a tool call",
+        "Describe what you want done. The assistant proposes the steps and "
+        "AGENTGATE decides each one before anything is allowed to run.",
+        chips=[
+            "A proposal is never an authorization",
+            "Email delivery is simulated",
+            "Works with or without a model key",
+        ],
+    )
+
+    uploads = _workspace_uploads(CTX.workspace)
+    source_names = ["The sample internal document"] + [
+        f"{record['display_name']} ({record['label']})" for record in uploads
+    ]
+
+    source_choice = st.selectbox(
+        "Which source should this request work on?",
+        source_names,
+        key="ws_source",
+        help=(
+            "Sensitivity always comes from the trusted source registry, never "
+            "from the text inside a document."
+        ),
+    )
+
+    documents = []
+    file_ref = ""
+
+    if source_choice == source_names[0]:
+        try:
+            documents = [
+                (ResearchAgent.SOURCE_ID, CTX.reader.read_sample()["content"])
+            ]
+        except Exception:
+            st.warning("The bundled sample document could not be read.")
     else:
-        st.info("No security events recorded yet. Run an action in Action Simulator.")
+        chosen = uploads[source_names.index(source_choice) - 1]
+        # The registered source id, not the file id, is what the trusted
+        # label registry knows about, so a read asks for the real
+        # classification instead of a guess.
+        file_ref = chosen.get("source_id") or chosen["file_id"]
+        st.caption(
+            f"**{chosen['display_name']}** is classified "
+            f"**{chosen['label']}**. Its text is released only by a "
+            "gateway-authorized read, never by the assistant."
+        )
+
+    st.markdown("#### Ask the workspace")
+
+    subject = "my workspace file" if file_ref else "the sample document"
+
+    for example in [
+        f"Read {subject} and write a summary report.",
+        f"Read {subject} and turn it into a PowerPoint presentation.",
+        f"Read {subject}, generate a report and send it to team@example.com.",
+    ]:
+        if st.button(
+            example, key=f"ws_example_{example}", use_container_width=True
+        ):
+            st.session_state["workspace_pending_prompt"] = example
+
+    prompt = st.chat_input("What should the assistant do?")
+
+    if st.session_state.get("workspace_pending_prompt"):
+        prompt = st.session_state.pop("workspace_pending_prompt")
+
+    if prompt:
+        try:
+            policy = get_policy()
+            gateway = SecureGateway(
+                PolicyEngine(policy),
+                audit_repository=get_audit_repository(),
+                approval_store=get_approval_store(),
+            )
+            agent = WorkspaceAgent(
+                gateway=gateway,
+                reader=reader,
+                artifact_store=get_artifact_store(),
+                inbox=inbox,
+                policy=policy,
+                workspace=CTX.workspace,
+            )
+
+            started = time.monotonic()
+
+            with st.status("Working on your request", expanded=True) as status:
+                st.write(
+                    "Step 1 of 3 - the assistant is turning your request into "
+                    "proposed actions."
+                )
+
+                turn = agent.run(
+                    prompt, documents=documents, file_ref=file_ref
+                )
+
+                elapsed = time.monotonic() - started
+
+                st.write(
+                    f"Step 2 of 3 - the gateway decided "
+                    f"{len(turn['actions'])} proposed step(s) in "
+                    f"{elapsed:.1f}s."
+                )
+
+                if turn["generated"]:
+                    st.write(
+                        f"Step 3 of 3 - {len(turn['generated'])} file(s) built."
+                    )
+
+                if turn["status"] == "BLOCKED":
+                    status.update(
+                        label="Finished, but AGENTGATE blocked a step",
+                        state="complete",
+                        expanded=False,
+                    )
+                elif turn["status"] == "APPROVAL_REQUIRED":
+                    status.update(
+                        label="Finished - one step is waiting for approval",
+                        state="complete",
+                        expanded=False,
+                    )
+                else:
+                    status.update(
+                        label=f"Done in {elapsed:.1f}s",
+                        state="complete",
+                        expanded=False,
+                    )
+
+            # A parked delivery needs its report body when the reviewer
+            # approves it later in this session.
+            payloads = st.session_state.setdefault("workspace_payloads", {})
+            for action in turn["actions"]:
+                if action["decision"] == "REQUIRE_APPROVAL" and action["recipient"]:
+                    payloads[action["recipient"]] = (
+                        turn["artifact"].get("content") or turn["summary"]
+                        or "AGENTGATE workspace report"
+                    )
+
+            st.session_state.setdefault("workspace_chat", []).append(
+                {"role": "user", "content": prompt}
+            )
+            st.session_state["workspace_chat"].append(
+                {"role": "agent", "content": "", "turn": turn}
+            )
+        except Exception as exc:
+            st.error(
+                f"That request could not be completed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    if st.button("Clear this conversation", key="ws_clear"):
+        st.session_state["workspace_chat"] = []
+        st.rerun()
+
+    for entry in st.session_state.get("workspace_chat", []):
+        if entry["role"] == "user":
+            with st.chat_message("user"):
+                st.write(entry["content"])
+            continue
+
+        with st.chat_message("assistant"):
+            _render_turn(entry["turn"], go)
+
+    theme.note(
+        "Proposals, document text and model output are untrusted. The "
+        "gateway evaluates every action against the trusted policy, and "
+        "nothing protected runs on the model's word alone."
+    )
+
+
+# ---------------- FILES ----------------
+elif page == "Files":
+    files_page.render(CTX, go)
+
+
+# ---------------- CREATE FILES ----------------
+elif page == "Create Files":
+    create_page.render(CTX, go)
+
+
+# ---------------- EMAIL ----------------
+elif page == "Email":
+    email_page.render(CTX, go)
 
 
 # ---------------- ACTION SIMULATOR ----------------
@@ -386,6 +880,11 @@ elif page == "Action Simulator":
             elif outcome.decision.value == "REQUIRE_APPROVAL":
                 st.warning("🟠 HUMAN APPROVAL REQUIRED")
                 st.write(outcome.reason)
+                st.code(str(outcome.approval_id))
+                st.info(
+                    "The protected tool did not run. Review it in the "
+                    "Approvals."
+                )
 
             else:
                 st.error("🔴 ACCESS BLOCKED")
@@ -401,110 +900,387 @@ elif page == "Action Simulator":
 
 
 
-# ---------------- APPROVAL CENTER ----------------
-elif page == "Approval Center":
-    st.subheader("Human Approval Center")
-    st.caption("Only authenticated, allowlisted reviewers can review actions.")
+# ---------------- APPROVALS ----------------
+elif page == "Approvals":
+    theme.hero(
+        "Approvals",
+        "Nothing parked here has run yet. A reviewer decides, and approving "
+        "an action can never override a policy denial.",
+        chips=[
+            "Rechecked against the current policy",
+            "Each approval is usable once",
+        ],
+    )
 
-    if not reviewer or not is_active_reviewer(reviewer["user_id"]):
-        st.error("Reviewer authorization is no longer active. Sign in again.")
+    backend = st.session_state.get("audit_backend", "SQLite")
+
+    reviewer_id = reviewer_gate()
+
+    if not reviewer_id:
         st.stop()
 
-    if st.session_state.get("audit_backend") != "Supabase":
-        st.warning("Select Supabase as the storage backend to review cloud approvals.")
+    store = get_approval_store()
+
+    try:
+        pending_requests = store.list_pending(limit=100)
+    except Exception as exc:
+        st.error(f"Could not load approval requests: {exc}")
+        st.stop()
+
+    if not pending_requests:
+        st.success("No pending approval requests.")
     else:
-        repository = SupabaseRepository()
+        st.write(f"Pending requests: {len(pending_requests)}")
 
-        try:
-            pending_requests = repository.list_pending(limit=100)
+        for item in pending_requests:
+            with st.container(border=True):
+                st.markdown(f"**Request:** `{item['id']}`")
 
-            if not pending_requests:
-                st.success("No pending approval requests.")
+                col_a, col_b = st.columns(2)
+
+                with col_a:
+                    st.write("Agent:", item["agent_id"])
+                    st.write("Operation:", item["operation"])
+                    st.write("Resource:", item["resource"])
+
+                with col_b:
+                    st.write("Recipient:", item["recipient"] or "-")
+                    st.write("Sensitivity:", item["data_label"])
+                    st.write("Expires:", item["expires_at"])
+
+                try:
+                    ticket_request = ActionRequest(
+                        agent_id=item["agent_id"],
+                        operation=item["operation"],
+                        resource=item["resource"],
+                        recipient=item["recipient"] or "",
+                        data_label=SecurityLabel.parse(item["data_label"]),
+                    )
+                    current = PolicyEngine(get_policy()).evaluate(
+                        ticket_request
+                    )
+                    st.caption(f"Current policy: {current.reason}")
+                except Exception as exc:
+                    st.caption(f"Policy recheck failed: {exc}")
+
+                col_approve, col_reject = st.columns(2)
+
+                with col_approve:
+                    if st.button(
+                        "Approve and execute",
+                        key=f"approve_{item['id']}",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        try:
+                            if not is_reviewer_authorized(reviewer_id):
+                                raise PermissionError(
+                                    "Reviewer access has been revoked."
+                                )
+
+                            get_approval_store().review(
+                                item["id"], "APPROVED", reviewer_id
+                            )
+
+                            outcome = make_gateway(
+                                item["recipient"]
+                                if item["operation"] == "deliver"
+                                else ""
+                            ).approve_and_execute(item["id"], ticket_request)
+
+                            if outcome.decision.value == "ALLOW":
+                                st.success(
+                                    "Policy rechecked, approval consumed once, "
+                                    "and the registered tool executed."
+                                )
+                                if outcome.result is not None:
+                                    st.json(outcome.result)
+                            else:
+                                st.error(
+                                    f"Execution refused: {outcome.reason}"
+                                )
+
+                            st.rerun()
+
+                        except Exception as exc:
+                            st.error(f"Approval failed: {exc}")
+
+                with col_reject:
+                    if st.button(
+                        "Reject",
+                        key=f"reject_{item['id']}",
+                        use_container_width=True,
+                    ):
+                        try:
+                            if not is_reviewer_authorized(reviewer_id):
+                                raise PermissionError(
+                                    "Reviewer access has been revoked."
+                                )
+
+                            outcome = SecureGateway(
+                                PolicyEngine(get_policy()),
+                                audit_repository=get_audit_repository(),
+                                approval_store=get_approval_store(),
+                            ).reject_approval(item["id"], reviewer_id)
+
+                            st.success(
+                                "Rejected. The action was not executed and "
+                                "the decision is in the audit trail."
+                            )
+                            st.rerun()
+
+                        except Exception as exc:
+                            st.error(f"Rejection failed: {exc}")
+
+    st.caption(
+        "Approvals are bound to one exact action, expire, and are consumed "
+        "once. A rejected or expired ticket can never execute."
+    )
+
+
+# ---------------- ACCESS CONTROL ----------------
+elif page == "Access Control":
+    from database.permission_store import (
+        AGENT_OPERATION,
+        APPROVAL_OPERATION,
+        RECIPIENT,
+        RESOURCE_OPERATION,
+    )
+
+    st.subheader("🗝️ Access Control")
+    st.caption(
+        "The policy is owned by the application. This panel can only "
+        "tighten it - never grant anything new."
+    )
+
+    base_policy = demo_policy()
+
+    try:
+        effective_policy = get_policy()
+    except Exception as exc:
+        st.error(f"Effective policy is unavailable: {exc}")
+        st.stop()
+
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("### Agent grants")
+        st.dataframe(
+            [
+                {
+                    "agent": agent_id,
+                    "allowed operations": ", ".join(sorted(operations)) or "-",
+                }
+                for agent_id, operations in (
+                    effective_policy.agent_permissions.items()
+                )
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("### Resource grants")
+        st.dataframe(
+            [
+                {
+                    "resource": resource,
+                    "permitted operations": ", ".join(sorted(operations)) or "-",
+                }
+                for resource, operations in (
+                    effective_policy.resource_permissions.items()
+                )
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with right:
+        st.markdown("### Recipients and clearance")
+        st.dataframe(
+            [
+                {
+                    "recipient": recipient,
+                    "clearance": str(
+                        effective_policy.recipient_clearance.get(recipient, "-")
+                    ),
+                    "authorized": (
+                        recipient in effective_policy.authorized_recipients
+                    ),
+                }
+                for recipient in sorted(base_policy.recipient_clearance)
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("### Approval-required operations")
+        st.write(
+            sorted(effective_policy.approval_required_operations) or "None"
+        )
+        st.write(
+            "Sensitivity triggers:",
+            {
+                operation: sorted(str(label) for label in labels)
+                for operation, labels in (
+                    effective_policy.approval_required_labels.items()
+                )
+            } or "None",
+        )
+
+    st.divider()
+    st.markdown("### Active restrictions")
+
+    permission_store = get_permission_store()
+    overrides = permission_store.list_overrides()
+
+    if not overrides:
+        st.info("No additional restrictions beyond the trusted policy.")
+    else:
+        for row in overrides:
+            cols = st.columns([3, 1])
+
+            with cols[0]:
+                st.write(
+                    f"**{row['kind']}** - `{row['key']}`"
+                    + (f" / `{row['value']}`" if row["value"] else "")
+                    + f" (set by `{str(row['created_by'])[:8]}`)"
+                )
+
+            with cols[1]:
+                if st.button(
+                    "Remove",
+                    key=f"remove_override_{row['kind']}_{row['key']}_{row['value']}",
+                    use_container_width=True,
+                ):
+                    reviewer_id = reviewer_gate()
+
+                    if not reviewer_id:
+                        st.error("A reviewer must authorize this change.")
+                    else:
+                        try:
+                            permission_store.remove_override(
+                                row["kind"],
+                                row["key"],
+                                row["value"],
+                                reviewer_id,
+                            )
+                            audit_permission_change(
+                                reviewer_id,
+                                "Restored trusted policy baseline: "
+                                f"{row['kind']} {row['key']} {row['value']}",
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Change refused: {exc}")
+
+    st.divider()
+    st.markdown("### Apply a restriction")
+
+    reviewer_id = reviewer_gate()
+
+    if not reviewer_id:
+        st.info(
+            "Unlock reviewing to change permissions. Agents and models "
+            "never reach this control."
+        )
+    else:
+        with st.form("permission_override"):
+            restriction_label = st.selectbox(
+                "Restriction",
+                [
+                    "Revoke an agent operation",
+                    "Disable an operation on a resource",
+                    "De-authorize a recipient",
+                    "Require approval for an operation",
+                ],
+            )
+
+            kind = {
+                "Revoke an agent operation": AGENT_OPERATION,
+                "Disable an operation on a resource": RESOURCE_OPERATION,
+                "De-authorize a recipient": RECIPIENT,
+                "Require approval for an operation": APPROVAL_OPERATION,
+            }[restriction_label]
+
+            if kind == AGENT_OPERATION:
+                options = [
+                    (agent_id, operation)
+                    for agent_id, operations in (
+                        base_policy.agent_permissions.items()
+                    )
+                    for operation in sorted(operations)
+                ]
+            elif kind == RESOURCE_OPERATION:
+                options = [
+                    (resource, operation)
+                    for resource, operations in (
+                        base_policy.resource_permissions.items()
+                    )
+                    for operation in sorted(operations)
+                ]
+            elif kind == RECIPIENT:
+                options = [
+                    (recipient, "")
+                    for recipient in sorted(base_policy.authorized_recipients)
+                ]
             else:
-                st.write(f"Pending requests: {len(pending_requests)}")
+                options = [
+                    (operation, "")
+                    for operation in sorted(
+                        {
+                            operation
+                            for operations in (
+                                base_policy.resource_permissions.values()
+                            )
+                            for operation in operations
+                        }
+                    )
+                ]
 
-                for item in pending_requests:
-                    with st.container(border=True):
-                        st.markdown(f"**Request:** `{item['id']}`")
-                        st.write("Agent:", item["agent_id"])
-                        st.write("Operation:", item["operation"])
-                        st.write("Resource:", item["resource"])
-                        st.write("Recipient:", item["recipient"])
-                        st.write("Sensitivity:", item["data_label"])
-                        st.write("Status:", item["status"])
+            labels = [
+                f"{key} / {value}" if value else key for key, value in options
+            ]
 
-                        col_approve, col_reject = st.columns(2)
+            target = st.selectbox("Target", labels or ["Nothing to restrict"])
+            submitted = st.form_submit_button(
+                "Apply restriction",
+                type="primary",
+                use_container_width=True,
+            )
 
-                        with col_approve:
-                            if st.button(
-                                "Approve and execute",
-                                key=f"approve_{item['id']}",
-                                type="primary",
-                                use_container_width=True,
-                            ):
-                                try:
-                                    if not is_active_reviewer(reviewer["user_id"]):
-                                        raise PermissionError("Reviewer access has been revoked.")
+        if submitted and labels:
+            key, value = options[labels.index(target)]
 
-                                    repository.review(
-                                        item["id"],
-                                        "APPROVED",
-                                        reviewer["user_id"],
-                                    )
+            try:
+                permission_store.add_override(
+                    kind, key, value, reviewer_id
+                )
+                audit_permission_change(
+                    reviewer_id,
+                    f"Tightened policy: {kind} {key} {value}",
+                )
+                st.success("Restriction applied and audited.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Change refused: {exc}")
 
-                                    request = ActionRequest(
-                                        agent_id=item["agent_id"],
-                                        operation=item["operation"],
-                                        resource=item["resource"],
-                                        recipient=item["recipient"],
-                                        data_label=SecurityLabel.parse(item["data_label"]),
-                                    )
+    st.divider()
+    st.markdown("### Permission change history")
 
-                                    gateway = make_gateway(
-                                        item["recipient"]
-                                        if item["operation"] == "deliver"
-                                        else ""
-                                    )
+    try:
+        changes = [
+            event
+            for event in get_events()
+            if event.get("operation") == "update_permissions"
+        ]
+    except Exception as exc:
+        st.error(f"Audit backend unavailable: {exc}")
+        changes = []
 
-                                    outcome = gateway.approve_and_execute(
-                                        item["id"],
-                                        request,
-                                    )
-
-                                    if outcome.decision.value == "ALLOW":
-                                        st.success("Approved and executed successfully.")
-                                        if outcome.result is not None:
-                                            st.json(outcome.result)
-                                    else:
-                                        st.error(f"Execution blocked: {outcome.reason}")
-
-                                    st.rerun()
-
-                                except Exception as exc:
-                                    st.error(f"Approval failed: {exc}")
-
-                        with col_reject:
-                            if st.button(
-                                "Reject",
-                                key=f"reject_{item['id']}",
-                                use_container_width=True,
-                            ):
-                                try:
-                                    if not is_active_reviewer(reviewer["user_id"]):
-                                        raise PermissionError("Reviewer access has been revoked.")
-
-                                    repository.review(
-                                        item["id"],
-                                        "REJECTED",
-                                        reviewer["user_id"],
-                                    )
-                                    st.success("Request rejected.")
-                                    st.rerun()
-                                except Exception as exc:
-                                    st.error(f"Rejection failed: {exc}")
-
-        except Exception as exc:
-            st.error(f"Could not load approval requests: {exc}")
+    if changes:
+        st.dataframe(changes[:20], use_container_width=True, hide_index=True)
+    else:
+        st.info("No permission changes recorded yet.")
 
 
 # ---------------- PROMPT INJECTION LAB ----------------
@@ -639,7 +1415,7 @@ elif page == "Information Flow":
 
 # ---------------- ARTIFACT VAULT ----------------
 elif page == "Artifact Vault":
-    st.subheader("??? Artifact Vault")
+    st.subheader("🗄️ Artifact Vault")
     st.caption("Save, reload and inspect derived artifacts with trusted provenance.")
 
     try:
@@ -717,7 +1493,7 @@ elif page == "Artifact Vault":
 
         artifact_id = st.text_input("Artifact ID")
 
-        if st.button("?? Load and Verify Artifact"):
+        if st.button("🔎 Load and Verify Artifact"):
             try:
                 loaded = artifact_store.load(artifact_id.strip())
 
@@ -745,10 +1521,196 @@ elif page == "Artifact Vault":
         st.error(f"Artifact Vault unavailable: {exc}")
 
 
-# ---------------- AUDIT CENTER ----------------
-elif page == "Audit Center":
-    st.subheader("📋 Security Audit Center")
-    st.caption("Review recorded security decisions.")
+
+# ---------------- DECLASSIFICATION CENTER ----------------
+elif page == "Declassification Center":
+    st.subheader("🔓 Controlled Declassification")
+    st.caption(
+        "Only authenticated, active reviewers can authorize "
+        "verified sensitivity downgrades."
+    )
+
+    if not reviewer:
+        st.error("Reviewer login is required.")
+        st.stop()
+
+    if st.session_state.get("audit_backend") != "Supabase":
+        st.warning("Declassification requires Supabase storage.")
+        st.stop()
+
+    repository = SupabaseRepository()
+
+    artifact_id = st.text_input(
+        "Artifact ID",
+        key="declassification_artifact_id",
+        placeholder="Paste the artifact UUID",
+    )
+
+    if st.button(
+        "Load and Verify Artifact",
+        key="load_declassification_artifact",
+    ):
+        try:
+            verified_reviewer = restore_reviewer_session(
+                st.session_state.get("reviewer_access_token"),
+                st.session_state.get("reviewer_refresh_token"),
+            )
+
+            loaded = repository.load_artifact(artifact_id.strip())
+
+            st.session_state["declassification_loaded_artifact"] = loaded
+            st.session_state["declassification_loaded_id"] = artifact_id.strip()
+
+            st.success(
+                f"Artifact verified. Reviewer: {verified_reviewer['email']}"
+            )
+
+        except Exception as exc:
+            st.session_state.pop("declassification_loaded_artifact", None)
+            st.session_state.pop("declassification_loaded_id", None)
+            st.error(f"Verification failed: {exc}")
+
+    loaded = st.session_state.get("declassification_loaded_artifact")
+    loaded_id = st.session_state.get("declassification_loaded_id")
+
+    if loaded and loaded_id == artifact_id.strip():
+        label_rank = {
+            "PUBLIC": 0,
+            "INTERNAL": 1,
+            "CONFIDENTIAL": 2,
+            "RESTRICTED": 3,
+        }
+
+        current_label = str(loaded["label"]).upper()
+
+        if current_label not in label_rank:
+            st.error("Unknown artifact sensitivity label.")
+            st.stop()
+
+        st.divider()
+        st.markdown("### Verified Artifact")
+
+        col1, col2 = st.columns(2)
+        col1.metric("Current Sensitivity", current_label)
+        col2.metric("Source Count", len(loaded.get("source_ids", [])))
+
+        st.write("**Artifact ID:**", loaded.get("artifact_id", loaded_id))
+        st.write("**Source IDs:**", loaded.get("source_ids", []))
+        st.write("**Source Labels:**", loaded.get("source_labels", []))
+        st.write("**Transformation:**", loaded.get("transformation", "Unknown"))
+
+        history = loaded.get("declassification_history", [])
+
+        st.markdown("### Declassification History")
+        if history:
+            st.dataframe(history, use_container_width=True, hide_index=True)
+        else:
+            st.info("No previous declassification events.")
+
+        lower_labels = [
+            label
+            for label, rank in label_rank.items()
+            if rank < label_rank[current_label]
+        ]
+
+        if not lower_labels:
+            st.success("Artifact is already PUBLIC. No further downgrade is possible.")
+        else:
+            st.divider()
+            st.markdown("### Authorize Classification Downgrade")
+
+            with st.form("declassification_form"):
+                new_label = st.selectbox(
+                    "New sensitivity label",
+                    lower_labels,
+                )
+
+                reason = st.text_area(
+                    "Reason for downgrade",
+                    placeholder="Explain why this artifact is eligible for a lower classification...",
+                )
+
+                confirmation = st.checkbox(
+                    "I confirm this downgrade is authorized and justified."
+                )
+
+                submitted = st.form_submit_button(
+                    "Authorize Declassification",
+                    type="primary",
+                )
+
+            if submitted:
+                try:
+                    if not confirmation:
+                        raise ValueError("Explicit confirmation is required.")
+
+                    if len(reason.strip()) < 10:
+                        raise ValueError(
+                            "Reason must contain at least 10 characters."
+                        )
+
+                    verified_reviewer = restore_reviewer_session(
+                        st.session_state.get("reviewer_access_token"),
+                        st.session_state.get("reviewer_refresh_token"),
+                    )
+
+                    reviewer_id = verified_reviewer["user_id"]
+
+                    if not is_active_reviewer(reviewer_id):
+                        raise PermissionError("Reviewer access has been revoked.")
+
+                    fresh_artifact = repository.load_artifact(loaded_id)
+                    fresh_label = str(fresh_artifact["label"]).upper()
+
+                    if fresh_label != current_label:
+                        raise RuntimeError(
+                            "Artifact classification changed. Reload it first."
+                        )
+
+                    if (
+                        new_label not in label_rank
+                        or label_rank[new_label] >= label_rank[fresh_label]
+                    ):
+                        raise PermissionError(
+                            "Only a genuine sensitivity downgrade is permitted."
+                        )
+
+                    result = repository.declassify_artifact(
+                        artifact_id=loaded_id,
+                        new_label=new_label,
+                        reviewer_id=reviewer_id,
+                        reason=reason.strip(),
+                    )
+
+                    verified_artifact = repository.load_artifact(loaded_id)
+
+                    if str(verified_artifact["label"]).upper() != new_label:
+                        raise RuntimeError(
+                            "Post-declassification verification failed."
+                        )
+
+                    st.session_state["declassification_loaded_artifact"] = (
+                        verified_artifact
+                    )
+
+                    st.success(
+                        f"Declassification recorded: {current_label} ? {new_label}"
+                    )
+                    st.json(result)
+                    st.rerun()
+
+                except Exception as exc:
+                    st.error(f"Declassification rejected: {exc}")
+
+
+# ---------------- ACTIVITY ----------------
+elif page == "Activity":
+    theme.hero(
+        "Activity",
+        "Every decision is recorded before the tool runs, so you can see "
+        "what was asked, what was allowed and what was refused.",
+        chips=["Audit before execution", "No keys or passwords recorded"],
+    )
 
     try:
         events = get_events()
@@ -796,15 +1758,15 @@ elif page == "Audit Center":
 
 # ---------------- AGENT CHAT ----------------
 elif page == "Agent Chat":
-    st.subheader("?? AGENTGATE Research Agent")
+    st.subheader("🤖 AGENTGATE Research Agent")
     st.caption(
         "Give your research task to the agent. "
         "Every protected tool action passes through SecureGateway."
     )
 
     st.info(
-        "Current mode: Deterministic research agent. "
-        "LLM integration will be added separately."
+        "Deterministic research agent. Every read, save and delivery goes "
+        "through SecureGateway under the trusted policy."
     )
 
     task = st.text_area(
@@ -816,7 +1778,7 @@ elif page == "Agent Chat":
         key="research_agent_task",
     )
 
-    if st.button("?? Run Research Agent", type="primary"):
+    if st.button("🚀 Run Research Agent", type="primary"):
         if not task.strip():
             st.warning("Please enter a research task.")
         else:
@@ -825,6 +1787,8 @@ elif page == "Agent Chat":
                     result = ResearchAgent(
                         artifact_store=get_artifact_store(),
                         audit_repository=get_audit_repository(),
+                        policy=get_policy(),
+                        approval_store=get_approval_store(),
                     ).run(task)
 
                 st.session_state["last_agent_result"] = result
@@ -844,6 +1808,10 @@ elif page == "Agent Chat":
             st.success(result.message)
         elif result.status == "BLOCKED":
             st.error(result.message)
+        elif result.status == "APPROVAL_REQUIRED":
+            st.warning(result.message)
+            st.code(result.approval_id or "")
+            st.info("Approve it in Approvals to run the delivery.")
         else:
             st.warning(result.message)
 
